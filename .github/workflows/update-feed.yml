@@ -1,36 +1,110 @@
-name: Update Jets RSS Feed
+import json,os,sys,time,urllib.request,xml.etree.ElementTree as ET
+from datetime import datetime,timezone
+from email.utils import formatdate
 
-on:
-  schedule:
-    - cron: "30 2 * * 0,1,3,5"
-  workflow_dispatch:
+JETS_ID='20';JETS_ABBR='NYJ'
+_now=datetime.now()
+SEASON=_now.year if _now.month>=8 else _now.year-1
+_owner=os.environ.get('GITHUB_REPOSITORY_OWNER','sndecola')
+FEED_URL=f'https://{_owner}.github.io/jets-rss-feed/feed.xml'
+ESPN_SCHED=f'https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{JETS_ID}/schedule?season={SEASON}&seasontype=2'
+ESPN_SUM='https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event={eid}'
+PFR={'ARI':'crd','ATL':'atl','BAL':'rav','BUF':'buf','CAR':'car','CHI':'chi','CIN':'cin','CLE':'cle','DAL':'dal','DEN':'den','DET':'det','GB':'gnb','HOU':'htx','IND':'clt','JAX':'jax','KC':'kan','LV':'rai','LAC':'sdg','LAR':'ram','MIA':'mia','MIN':'min','NE':'nwe','NO':'nor','NYG':'nyg','NYJ':'nyj','PHI':'phi','PIT':'pit','SF':'sfo','SEA':'sea','TB':'tam','TEN':'oti','WAS':'was'}
+UA=f'JetsRSSBot/1.0 (+https://github.com/{_owner}/jets-rss-feed)'
 
-permissions:
-  contents: write
+def fetch(url):
+    req=urllib.request.Request(url,headers={'User-Agent':UA})
+    with urllib.request.urlopen(req,timeout=20) as r:
+        return json.loads(r.read())
 
-jobs:
-  generate:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+def top_leader(leaders,kw):
+    for cat in leaders:
+        if kw.lower() in (cat.get('name','')+' '+cat.get('shortDisplayName','')).lower():
+            L=cat.get('leaders',[])
+            if L:
+                return L[0].get('athlete',{}).get('displayName','?')+' ('+L[0].get('displayValue','')+')'
+    return 'N/A'
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+def pfr_url(d,ha):
+    return 'https://www.pro-football-reference.com/boxscores/'+d.replace('-','')[:8]+'0'+PFR.get(ha,ha.lower())+'.htm'
 
-      - name: Generate RSS feed
-        run: python generate_rss.py
+def get_ids():
+    data=fetch(ESPN_SCHED)
+    return [e['id'] for e in data.get('events',[]) if e.get('competitions',[{}])[0].get('status',{}).get('type',{}).get('state','')=='post']
 
-      - name: Commit and push if feed changed
-        run: |
-          git config user.name "Jets RSS Bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add feed.xml
-          if git diff --cached --quiet; then
-            echo "feed unchanged"
-          else
-            git commit -m "update Jets RSS feed [skip ci]"
-            git push
+def parse(eid):
+    data=fetch(ESPN_SUM.format(eid=eid))
+    hdr=data.get('header',{})
+    comp=hdr.get('competitions',[{}])[0]
+    teams=comp.get('competitors',[])
+    home=next((t for t in teams if t.get('homeAway')=='home'),teams[0] if teams else {})
+    away=next((t for t in teams if t.get('homeAway')=='away'),teams[-1] if teams else {})
+    ha=home.get('team',{}).get('abbreviation','?')
+    hs=home.get('score','?');as_=away.get('score','?')
+    jh=ha==JETS_ABBR
+    js=hs if jh else as_;os_=as_ if jh else hs
+    opp=(away if jh else home).get('team',{}).get('displayName','?')
+    try: result='W' if int(js)>int(os_) else 'L'
+    except: result='?'
+    dr=comp.get('date','')[:10]
+    try:
+        dt=datetime.strptime(dr,'%Y-%m-%d')
+        ds=dt.strftime('%B %-d, %Y')
+        ts=datetime(dt.year,dt.month,dt.day,23,59,tzinfo=timezone.utc).timestamp()
+    except:
+        ds,ts=dr,datetime.now(timezone.utc).timestamp()
+    ld=data.get('leaders',[]);st={}
+    for t in data.get('boxscore',{}).get('teams',[]):
+        if t.get('team',{}).get('abbreviation','')==JETS_ABBR:
+            for s in t.get('statistics',[]): st[s.get('name','')]=s.get('displayValue','N/A')
+    return dict(eid=eid,week=str(hdr.get('week','?')),date=ds,result=result,js=js,os=os_,opp=opp,
+        passing=top_leader(ld,'passing'),rushing=top_leader(ld,'rushing'),receiving=top_leader(ld,'receiving'),
+        tot=st.get('totalYards','N/A'),pyd=st.get('netPassingYards','N/A'),ryd=st.get('rushingYards','N/A'),
+        to=st.get('turnovers','N/A'),td=st.get('thirdDownEff','N/A'),top=st.get('possessionTime','N/A'),
+        sk=st.get('sacks','N/A'),espn='https://www.espn.com/nfl/game/_/gameId/'+eid,pfr=pfr_url(dr,ha),pub=formatdate(ts))
+
+def build(games):
+    root=ET.Element('rss',version='2.0')
+    root.set('xmlns:atom','http://www.w3.org/2005/Atom')
+    ch=ET.SubElement(root,'channel')
+    ET.SubElement(ch,'title').text='NY Jets Postgame Stats'
+    ET.SubElement(ch,'link').text='https://www.newyorkjets.com'
+    ET.SubElement(ch,'description').text='Postgame stats for every Jets game'
+    ET.SubElement(ch,'language').text='en-us'
+    ET.SubElement(ch,'lastBuildDate').text=formatdate()
+    ET.SubElement(ch,'atom:link',attrib={'href':FEED_URL,'rel':'self','type':'application/rss+xml'})
+    for g in games:
+        lbl='WIN' if g['result']=='W' else 'LOSS'
+        item=ET.SubElement(ch,'item')
+        ET.SubElement(item,'title').text=f"Jets {lbl} {g['js']}-{g['os']} vs {g['opp']} | Wk {g['week']} - {g['date']}"
+        ET.SubElement(item,'link').text=g['espn']
+        ET.SubElement(item,'guid',isPermaLink='false').text=g['eid']
+        ET.SubElement(item,'pubDate').text=g['pub']
+        ET.SubElement(item,'description').text=(
+            f"{lbl}: NYJ {g['js']}, {g['opp']} {g['os']}\n\n"
+            f"Stat Leaders\n  Passing: {g['passing']}\n  Rushing: {g['rushing']}\n  Receiving: {g['receiving']}\n\n"
+            f"Team Stats (NYJ)\n  Total: {g['tot']}  Pass: {g['pyd']}  Rush: {g['ryd']}\n"
+            f"  Turnovers: {g['to']}  3rd Down: {g['td']}  TOP: {g['top']}  Sacks: {g['sk']}\n\n"
+            f"ESPN: {g['espn']}\nPFR:  {g['pfr']}")
+    ET.indent(root,space='  ')
+    return "<?xml version='1.0' encoding='utf-8'?>\n"+ET.tostring(root,encoding='unicode')
+
+def main():
+    print(f'Jets RSS - Season {SEASON}')
+    ids=get_ids();print(f'Games found: {len(ids)}');games=[]
+    for eid in ids:
+        try:
+            g=parse(eid);games.append(g)
+            print(f"  Wk {g['week']}: {g['result']} {g['js']}-{g['os']} vs {g['opp']}")
+            time.sleep(0.4)
+        except Exception as e:
+            print(f'  ERR {eid}: {e}',file=sys.stderr)
+    games.sort(key=lambda g:g['pub'],reverse=True)
+    with open('feed.xml','w',encoding='utf-8') as f:
+        f.write(build(games[:25]))
+    print(f'Done - {len(games)} games written.')
+
+if __name__=='__main__':
+    main()
+
           fi
