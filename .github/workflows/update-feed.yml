@@ -1,0 +1,36 @@
+name: Update Jets RSS Feed
+
+on:
+  schedule:
+    - cron: "30 2 * * 0,1,3,5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate RSS feed
+        run: python generate_rss.py
+
+      - name: Commit and push if feed changed
+        run: |
+          git config user.name "Jets RSS Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add feed.xml
+          if git diff --cached --quiet; then
+            echo "feed unchanged"
+          else
+            git commit -m "update Jets RSS feed [skip ci]"
+            git push
+          fi
